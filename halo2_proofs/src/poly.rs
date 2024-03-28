@@ -5,6 +5,7 @@
 use crate::arithmetic::parallelize;
 use crate::plonk::Assigned;
 
+use ark_std::{end_timer, start_timer};
 use group::ff::{BatchInvert, Field};
 use pairing::arithmetic::FieldExt;
 use rayon::iter::*;

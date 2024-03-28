@@ -1,4 +1,5 @@
 use crate::helpers::AssignWitnessCollection;
+use crate::plonk::range_check::{Range, RangeCheckRelAssigner};
 use ark_std::iterable::Iterable;
 use ark_std::UniformRand;
 use ark_std::{end_timer, start_timer};
@@ -13,12 +14,13 @@ use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use rayon::prelude::IntoParallelRefIterator;
 use rayon::slice::ParallelSlice;
+use std::collections::{BTreeMap, HashMap};
 use std::env::var;
 use std::fs::File;
 use std::iter::FromIterator;
 use std::ops::RangeTo;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use std::{iter, sync::atomic::Ordering};
 
@@ -158,6 +160,38 @@ pub fn create_single_instances<C: CurveAffine, E: EncodedChallenge<C>, T: Transc
     Ok(instance)
 }
 
+fn sort<Scalar: FieldExt + PrimeField<Repr = K>, K: std::hash::Hash + std::cmp::Eq + Clone>(
+    values: &[Scalar],
+    hasher: impl Fn(&Scalar) -> K,
+) -> Vec<Scalar> {
+    let len = values.len();
+
+    let mut hash = HashMap::<K, usize>::default();
+    for value in values {
+        hash.entry(hasher(&value))
+            .and_modify(|e| *e += 1)
+            .or_insert(1);
+    }
+
+    let mut values = hash.into_iter().collect::<Vec<_>>();
+    values.sort_by(|a, b| {
+        Scalar::from_repr(a.0.clone())
+            .unwrap()
+            .cmp(&Scalar::from_repr(b.0.clone()).unwrap())
+    });
+
+    values
+        .into_iter()
+        .map(|(k, v)| {
+            let value = Scalar::from_repr(k).unwrap();
+            vec![value; v]
+        })
+        .fold(Vec::with_capacity(len), |mut acc, v| {
+            acc.extend(v);
+            acc
+        })
+}
+
 /// This creates a proof for the provided `circuit` when given the public
 /// parameters `params` and the proving key [`ProvingKey`] that was
 /// generated previously for the same circuit. The provided `instances`
@@ -176,7 +210,10 @@ pub fn create_proof_ext<
     mut rng: R,
     transcript: &mut T,
     use_gwc: bool,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    <<C as CurveAffine>::ScalarExt as PrimeField>::Repr: std::hash::Hash + std::cmp::Eq,
+{
     let domain = &pk.vk.domain;
 
     let timer = start_timer!(|| "instance");
@@ -792,7 +829,10 @@ pub fn create_proof_with_shplonk<
     instances: &[&[&[C::Scalar]]],
     rng: R,
     transcript: &mut T,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    <<C as CurveAffine>::ScalarExt as PrimeField>::Repr: std::hash::Hash + std::cmp::Eq,
+{
     create_proof_ext(params, pk, circuits, instances, rng, transcript, false)
 }
 
@@ -813,7 +853,10 @@ pub fn create_proof<
     instances: &[&[&[C::Scalar]]],
     rng: R,
     transcript: &mut T,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    <<C as CurveAffine>::ScalarExt as PrimeField>::Repr: std::hash::Hash + std::cmp::Eq,
+{
     create_proof_ext(params, pk, circuits, instances, rng, transcript, true)
 }
 
@@ -1436,7 +1479,9 @@ pub fn generate_advice_from_synthesize<'a, C: CurveAffine, ConcreteCircuit: Circ
     circuit: &'a ConcreteCircuit,
     instances: &'a [&'a [C::Scalar]],
     advices: &'a [*mut [C::Scalar]],
-) {
+) where
+    <C::ScalarExt as PrimeField>::Repr: std::hash::Hash + std::cmp::Eq,
+{
     use Assigned;
     use Column;
     use Error;
@@ -1447,9 +1492,15 @@ pub fn generate_advice_from_synthesize<'a, C: CurveAffine, ConcreteCircuit: Circ
 
     let meta = &pk.vk.cs;
 
+    let first_unassigned_offset = (0..meta.num_advice_columns)
+        .into_iter()
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect::<Vec<_>>();
+
     #[derive(Clone)]
     struct WitnessCollection<'a, F: Field> {
         pub advice: &'a [*mut [F]],
+        first_unassigned_offset: &'a [Arc<AtomicUsize>],
         instances: &'a [&'a [F]],
         usable_rows: core::ops::RangeTo<usize>,
         _marker: std::marker::PhantomData<F>,
@@ -1519,6 +1570,11 @@ pub fn generate_advice_from_synthesize<'a, C: CurveAffine, ConcreteCircuit: Circ
                 .and_then(|v| unsafe { (*v).as_mut().unwrap() }.get_mut(row))
                 .ok_or(Error::BoundsFailure)? = v;
 
+            self.first_unassigned_offset
+                .get(column.index())
+                .and_then(|offset| Some(offset.fetch_max(row + 1, Ordering::Relaxed)))
+                .unwrap();
+
             Ok(())
         }
 
@@ -1572,6 +1628,7 @@ pub fn generate_advice_from_synthesize<'a, C: CurveAffine, ConcreteCircuit: Circ
 
     let mut witness = WitnessCollection {
         advice: advices,
+        first_unassigned_offset: &first_unassigned_offset[..],
         instances,
         // The prover will not be allowed to assign values to advice
         // cells that exist within inactive rows, which include some
@@ -1591,4 +1648,79 @@ pub fn generate_advice_from_synthesize<'a, C: CurveAffine, ConcreteCircuit: Circ
     )
     .unwrap();
     end_timer!(timer);
+
+    {
+        let last = pk.get_vk().domain.n - (pk.get_vk().cs.blinding_factors() as u64 + 1) - 1;
+        pk.vk.cs.range_check.0.iter().for_each(|argument| {
+            let origin_column_index = argument.origin.index;
+
+            let first_unassigned_offset = first_unassigned_offset
+                .get(origin_column_index)
+                .unwrap()
+                .load(Ordering::Relaxed);
+
+            let advice = unsafe {
+                advices
+                    .get(argument.origin.index)
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+            };
+
+            // let values = &mut advices.get_mut(argument.origin.index).unwrap().values;
+            let mut offset = last as usize;
+
+            let assigner: RangeCheckRelAssigner = argument.into();
+            let mut iter = assigner.into_iter();
+
+            while let Some(value) = iter.next() {
+                *advice.get_mut(offset).unwrap() = C::ScalarExt::from(value as u64);
+                offset -= 1;
+            }
+
+            assert!(first_unassigned_offset <= offset);
+        });
+
+        let timer = start_timer!(|| "sort range check");
+
+        let sort = {
+            let advices = advices
+                .iter()
+                .map(|advice| unsafe { advice.as_ref() }.unwrap())
+                .collect::<Vec<_>>();
+
+            let sort = pk
+                .vk
+                .cs
+                .range_check
+                .0
+                .par_iter()
+                .map(|argument| {
+                    let origin_advice =
+                        &advices.get(argument.origin.index).unwrap()[0..unusable_rows_start];
+
+                    let mut value = sort::<C::ScalarExt, _>(origin_advice, |value| value.to_repr());
+                    value.resize(pk.get_vk().domain.n as usize, C::ScalarExt::zero());
+
+                    value
+                })
+                .collect::<Vec<_>>();
+            end_timer!(timer);
+
+            sort
+        };
+
+        pk.vk
+            .cs
+            .range_check
+            .0
+            .iter()
+            .zip(sort.into_iter())
+            .for_each(|(argument, sorted_value)| {
+                let advice =
+                    unsafe { &mut advices.get(argument.sort.index).unwrap().as_mut().unwrap() };
+
+                advice.copy_from_slice(&sorted_value);
+            });
+    }
 }

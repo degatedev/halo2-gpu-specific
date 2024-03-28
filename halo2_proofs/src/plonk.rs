@@ -24,6 +24,7 @@ mod evaluation;
 mod keygen;
 pub(crate) mod lookup;
 pub(crate) mod permutation;
+pub mod range_check;
 pub(crate) mod shuffle;
 mod vanishing;
 
@@ -151,9 +152,7 @@ impl<C: CurveAffine> CircuitData<C> {
         let fixed_commitments: Vec<_> = (0..cs.num_fixed_columns)
             .map(|_| C::read(reader))
             .collect::<Result<_, _>>()?;
-
         let permutation = permutation::VerifyingKey::read(reader, &cs.permutation)?;
-
         Ok(VerifyingKey {
             domain,
             cs,
