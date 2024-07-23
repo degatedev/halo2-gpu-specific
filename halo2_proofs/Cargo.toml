@@ -78,12 +78,13 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 getrandom = { version = "0.2", features = ["js"] }
 
 [features]
-default = []
+default = ["circuit-params"]
 dev-graph = ["plotters", "tabbycat"]
 gadget-traces = ["backtrace"]
 sanity-checks = []
 profile = ["ark-std/print-trace"]
 cuda = ["ec-gpu-gen/cuda", "pairing/gpu"]
+circuit-params = []
 
 [lib]
 bench = false
